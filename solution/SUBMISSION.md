@@ -1,53 +1,185 @@
-# Submission — Durable Campaign Dispatcher
+# Submission
+
+## Candidate
+- **Name:** Shaurya Sehgal
+- **Assignment chosen:** B (Workflow)
+- **Time spent:** [Enter your honest estimate]
+
+## How to run
+
+### 1. Install dependencies
+```bash
+pip install -r requirements.txt
+```
+
+### 2. Start PostgreSQL
+Start the PostgreSQL service using the supplied Docker Compose configuration.
+
+Set the database connection:
+```bash
+export DATABASE_URL='postgresql+psycopg://au_user:au_local_password@127.0.0.1:5433/campaign_dispatcher'
+```
+
+### 3. Initialize and seed
+```bash
+cd solution
+export PYTHONPATH="$PWD"
+
+python -m scripts.init_db
+python -m scripts.seed_data
+```
+
+### 4. Start the mock telephony provider
+In a separate terminal:
+```bash
+cd assignment-b-workflow
+python -m mock_telephony --speed 600 --seed 7 --failure-scale 0 --port 8099
+```
+
+### 5. Start the API
+In another terminal:
+```bash
+cd solution
+export PYTHONPATH="$PWD"
+uvicorn app.main:app --host 0.0.0.0 --port 8200
+```
+
+### 6. Start the dispatcher
+```bash
+cd solution
+export PYTHONPATH="$PWD"
+python -m scripts.run_dispatcher
+```
+
+### 7. Run tests
+```bash
+cd solution
+export PYTHONPATH="$PWD"
+python -m compileall -q app scripts
+python -m pytest tests/ -q
+```
 
 ## Design
 
-This implementation uses a PostgreSQL-backed state machine. PostgreSQL is the durable source of truth for lead state, accepted attempts, idempotency keys, phone reservations, webhook fingerprints, and global DND suppression.
+The solution uses a PostgreSQL-backed state machine with a Python dispatcher and FastAPI webhook receiver.
 
-A provider request is never sent before its `CallAttempt` and `PhoneLock` are committed. The `request_id` is generated once and reused for every retry or recovery request. The provider's idempotency contract makes replaying that request safe.
+PostgreSQL stores tenants, campaigns, leads, call attempts, webhook events, phone locks and phone suppressions.
+
+The dispatcher selects eligible leads according to campaign calling windows, regulatory restrictions, tenant concurrency, callback priority and retry scheduling.
+
+Each call attempt receives a persistent request ID before contacting the provider. Provider acceptance is persisted against that request ID. This allows recovery to query the provider and safely reuse the same idempotency key after an ambiguous outcome.
+
+Phone locks prevent simultaneous calls to the same phone number. Tenant-level active-call checks enforce concurrency across campaigns.
 
 ### Lead lifecycle
 
-```mermaid
-stateDiagram-v2
-    [*] --> pending
-    pending --> calling: claim + durable reservation
-    retry_wait --> calling: retry due
-    callback_scheduled --> calling: callback due and window open
-    calling --> completed: interested / not_interested / wrong_number
-    calling --> completed: dnd (also suppress phone globally)
-    calling --> retry_wait: busy / no_answer / failed, attempts remain
-    calling --> exhausted: retryable result at max attempts
-    calling --> callback_scheduled: callback_requested, attempts remain
-    calling --> exhausted: callback_requested at max attempts
-    pending --> dnd_blocked: another lead on phone opts out
-    retry_wait --> dnd_blocked: another lead on phone opts out
-    callback_scheduled --> dnd_blocked: another lead on phone opts out
+```text
+                 ┌──────────────┐
+                 │   PENDING    │
+                 └──────┬───────┘
+                        │
+                 Eligible to call
+                        │
+                 ┌──────▼───────┐
+                 │   CALLING    │
+                 └──────┬───────┘
+                        │
+                  Call result
+                        │
+          ┌─────────────┼────────────────┐
+          │             │                │
+     Terminal       Retryable         Callback
+    disposition      outcome          requested
+          │             │                │
+          ▼             ▼                ▼
+      COMPLETED     RETRY_WAIT    CALLBACK_SCHEDULED
+                        │                │
+                        └───────┬────────┘
+                                │
+                         Eligible again
+                                │
+                                ▼
+                             CALLING
+
+     Maximum attempts reached without terminal disposition
+                                │
+                                ▼
+                            EXHAUSTED
+
+     Global DND suppression
+                                │
+                                ▼
+                           DND_BLOCKED
 ```
 
-`completed`, `exhausted`, and `dnd_blocked` are final states. A lead's own `dnd` disposition is `completed`; other unfinished leads sharing that phone become `dnd_blocked`.
+### At-most-once dialling
 
-## Scheduling and safety
+- A persistent request ID is created for each attempt.
+- Database transactions and unique constraints protect attempt and phone-lock creation.
+- The same request ID is reused when resolving ambiguous provider outcomes.
+- Provider lookup occurs before resubmitting a prepared attempt.
+- Phone locks prevent simultaneous calls to the same phone number.
+- Webhook fingerprints prevent duplicate event processing.
 
-- The provider's simulated clock is used for every dispatch decision.
-- The clock is refreshed before every call claim; a batch never reuses a stale simulated timestamp.
-- Campaign weekday/time windows and the global 09:00–21:00 IST regulatory window are checked before claiming.
-- Callbacks have priority over retries, and retries have priority over fresh leads.
-- A tenant row lock serializes claims; the tenant-wide active-call count enforces concurrency across campaigns.
-- A unique `PhoneLock.phone` constraint prevents simultaneous calls to the same phone across campaigns.
-- Global `PhoneSuppression` prevents future calls to a DND phone.
-- A claim is not counted as an attempt. `Lead.attempts` advances only after provider acceptance is known, satisfying the accepted-call definition.
+## Decisions & assumptions
 
-## Failure and recovery
+| Decision | Why | Alternative considered |
+|---|---|---|
+| PostgreSQL-backed state machine | Durable state and transactional consistency | SQLite |
+| Persistent provider request IDs | Resolve ambiguous 504 responses safely | Generate a new ID per retry |
+| Separate webhook receiver | Process asynchronous provider results | Polling only |
+| Persistent phone locks | Prevent concurrent calls to one phone | In-memory locking |
+| Provider clock for scheduling | Business rules use simulated time | System clock |
+| Reconciliation of active calls | Recover missing webhooks | Depend only on webhook delivery |
 
-- **503:** look up the `request_id`; if absent, retry the same request ID.
-- **504/network timeout:** treat the outcome as ambiguous, look up the same request ID, and only re-submit with that same idempotency key if the provider reports it absent.
-- **Webhook duplicates:** an atomic insert with a unique payload fingerprint makes duplicate delivery harmless.
-- **Webhook lost:** active calls are reconciled against the provider's call lookup endpoint; the provider result is processed through the same webhook state transition.
-- **Crash before provider POST:** a durable `prepared` attempt is found on restart and submitted with the same request ID.
-- **Crash after provider acceptance:** restart looks up the prepared request ID, persists the call SID, then reconciles the result if it has ended.
-- **Webhook before POST response:** webhook processing records the accepted attempt and call SID; later acceptance persistence is idempotent and does not reopen a completed attempt.
+## Failure modes considered
 
-## Run and verify
+- Duplicate webhook delivery: handled using event fingerprints and idempotent processing.
+- Invalid webhook signatures: rejected using HMAC-SHA256 verification.
+- Lost webhooks: recovered by querying provider call records.
+- Ambiguous provider responses: resolved using the persistent request ID.
+- Process crashes: prepared attempts and active calls can be recovered from persistent state.
+- Duplicate phone calls: prevented using phone locks.
+- Calling-window violations: checked before dispatch and during prepared-attempt recovery.
+- DND: persisted globally by phone number.
+- Provider unavailability: handled through provider error handling and later recovery.
 
-See `README.md` for the local run commands. When all 200 leads are final, the dispatcher writes `final_state.csv`. The exporter checks every row against the provider's `/admin/leads` response and refuses to write a CSV if there are mismatches or incomplete leads.
+Known limitations:
+- A complete crash-and-restart acceptance test against the original provider remains to be demonstrated.
+- Injected provider failures and unseen-seed evaluation remain to be independently validated.
+
+## Testing
+
+- Python compilation completed successfully.
+- Automated tests: 7 passed.
+- Full local run processed 200 leads.
+- Database reconciliation reported zero active attempts.
+- Provider reported zero violations and zero active calls.
+
+## Results
+
+Full local run:
+
+| Metric | Result |
+|---|---:|
+| Total leads | 200 |
+| Completed | 138 |
+| Exhausted | 61 |
+| DND blocked | 1 |
+| Provider calls | 409 |
+| Provider violations | 0 |
+| Active calls | 0 |
+| Webhooks delivered | 409 |
+| Maximum Zen Retail concurrency | 3 |
+| Maximum Acme Insurance concurrency | 3 |
+| Automated tests | 7 passed |
+
+`final_state.csv` was generated with all 200 leads in terminal states.
+
+## If I had another day
+
+1. Run crash-and-restart tests at multiple points during dispatch.
+2. Test with injected 503 and ambiguous 504 failures.
+3. Test using multiple unseen provider seeds.
+4. Improve callback lateness and scheduling efficiency.
+5. Add structured observability and per-campaign progress reporting.
