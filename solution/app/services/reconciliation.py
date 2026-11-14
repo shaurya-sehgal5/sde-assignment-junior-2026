@@ -1,4 +1,6 @@
+
 import json
+from datetime import datetime, timedelta
 
 from sqlalchemy import select
 
@@ -10,13 +12,23 @@ from app.services.dispatcher import (
     submit_claimed_call,
 )
 from app.services.provider import provider, ProviderError, ProviderUnavailable
+from app.services.scheduling import is_inside_calling_window
 from app.services.webhooks import process_webhook
+
+
+# Avoid starting a recovery submission immediately before a campaign closes.
+# The provider clock is accelerated, so leave a small safety margin.
+RECOVERY_CLOSE_BUFFER_MINUTES = 2
 
 
 def recover_prepared_attempts() -> int:
     """
     Recover the crash window between persisting a prepared attempt and
     persisting the provider's acceptance response.
+
+    Existing provider calls are recovered regardless of current calling
+    hours. New submissions are deferred until the campaign window is open
+    and has sufficient time remaining.
     """
     with SessionLocal() as db:
         rows = db.execute(
@@ -34,31 +46,54 @@ def recover_prepared_attempts() -> int:
         ).all()
 
         pending = [
-            ClaimedCall(
-                request_id=attempt.request_id,
-                call_number=attempt.attempt_number,
-                campaign_id=attempt.campaign_id,
-                lead_id=attempt.lead_id,
-                phone=lead.phone,
-                customer_name=lead.customer_name,
-                tenant_id=campaign.tenant_id,
+            (
+                ClaimedCall(
+                    request_id=attempt.request_id,
+                    call_number=attempt.attempt_number,
+                    campaign_id=attempt.campaign_id,
+                    lead_id=attempt.lead_id,
+                    phone=lead.phone,
+                    customer_name=lead.customer_name,
+                    tenant_id=campaign.tenant_id,
+                ),
+                campaign,
             )
             for attempt, lead, campaign in rows
         ]
 
     recovered = 0
-    for claimed in pending:
+
+    for claimed, campaign in pending:
         try:
+            # First resolve whether the provider already accepted this call.
             existing = provider.find_by_request_id(claimed.request_id)
+
             if existing is not None:
                 persist_provider_acceptance(claimed.request_id, existing)
                 recovered += 1
                 print("RECOVERED ACCEPTANCE:", claimed.lead_id)
                 continue
 
-            # Provider confirms that this idempotency key is not present.
-            # Re-submit the exact same key; provider-side idempotency protects
-            # against an acceptance becoming visible between lookup and POST.
+            # No existing provider call: check the live simulated clock
+            # before making a new submission.
+            clock = provider.get_clock()
+            now = datetime.fromisoformat(clock["sim_now"])
+
+            safe_submission_time = now + timedelta(
+                minutes=RECOVERY_CLOSE_BUFFER_MINUTES
+            )
+
+            if not is_inside_calling_window(campaign, safe_submission_time):
+                print(
+                    "PREPARED RECOVERY DEFERRED:",
+                    claimed.lead_id,
+                    "campaign window closed or too close to closing time",
+                    "sim_now=",
+                    now.isoformat(),
+                )
+                continue
+
+            # Re-submit the exact same idempotency key.
             submit_claimed_call(claimed)
             recovered += 1
             print("RESUBMITTED PREPARED:", claimed.lead_id)
@@ -100,11 +135,15 @@ def reconcile_active_calls() -> int:
         ]
 
     reconciled = 0
+
     for call in calls:
         try:
             record = provider.get_call(call["call_sid"])
+
             if not record or record.get("state") not in (
-                "ended", "completed", "finished"
+                "ended",
+                "completed",
+                "finished",
             ):
                 continue
 
@@ -127,11 +166,14 @@ def reconcile_active_calls() -> int:
                 "ended_at": outcome.get("ended_at"),
                 "duration_sec": outcome.get("duration_sec", 0),
             }
+
             raw = json.dumps(
-                payload, separators=(",", ":")
+                payload,
+                separators=(",", ":"),
             ).encode()
 
             result = process_webhook(payload, raw)
+
             if result.get("result") == "processed":
                 reconciled += 1
                 print("RECONCILED:", call["lead_id"], result)
