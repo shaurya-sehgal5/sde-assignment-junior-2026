@@ -3,7 +3,7 @@
 ## Candidate
 - **Name:** Shaurya Sehgal
 - **Assignment chosen:** B (Workflow)
-- **Time spent:** [Enter your honest estimate]
+- **Time spent:** 5h
 
 ## How to run
 
